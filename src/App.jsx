@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import pkg from '../package.json';
+import GAS_SCRIPT from '../gas/Code.gs?raw';
 const APP_VERSION = pkg.version;
 import { 
   ShoppingCart, Settings, RefreshCw, CheckCircle, BarChart3, 
@@ -109,6 +110,28 @@ const stringifyToppings = (toppings) => {
 
 // --- Main Component ---
 const loadLS = (key, fallback) => { try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch { return fallback; } };
+
+const fetchJson = async (url, options = {}) => {
+  const response = await fetch(url, options);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const data = await response.json();
+  if (!data || data.status === 'error') throw new Error(data?.message || 'サーバー処理に失敗しました');
+  return data;
+};
+
+const postJson = (url, payload) => fetchJson(url, {
+  method: 'POST',
+  headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+  body: JSON.stringify(payload),
+});
+
+const createClientOrderId = () =>
+  globalThis.crypto?.randomUUID?.() || `order-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+const escapeCsv = (value) => {
+  const text = value == null ? '' : String(value);
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+};
 
 export default function App() {
 
@@ -239,8 +262,7 @@ export default function App() {
     if (!gasUrl || !navigator.onLine) { if(!silent) showToast("オフラインまたはURL未設定", "warning"); return; }
     if (!silent) setIsMenuSyncing(true);
     try {
-      const resMenu = await fetch(`${gasUrl}?action=getMenu`);
-      const dataMenu = await resMenu.json();
+      const dataMenu = await fetchJson(`${gasUrl}?action=getMenu`);
       if (dataMenu.items) {
         setMenuItems(prev => {
           const localMap = new Map(prev.map(i => [i.id, i]));
@@ -263,8 +285,7 @@ export default function App() {
           return [...updated, ...newFromGas].filter(p => !p.gasManaged || gasMap.has(p.id));
         });
       }
-      const resStaff = await fetch(`${gasUrl}?action=getStaff`);
-      const dataStaff = await resStaff.json();
+      const dataStaff = await fetchJson(`${gasUrl}?action=getStaff`);
       if (dataStaff.staff) setStaffList(dataStaff.staff);
       if (!silent) showToast('データ同期完了', 'success');
     } catch (e) {
@@ -278,8 +299,7 @@ export default function App() {
     if (!gasUrl || !navigator.onLine) { showToast("オフラインまたはURL未設定", "warning"); return; }
     setIsHistorySyncing(true);
     try {
-      const res = await fetch(`${gasUrl}?action=getSales&limit=50`);
-      const data = await res.json();
+      const data = await fetchJson(`${gasUrl}?action=getSales&limit=50`);
       if (data.sales) {
         setSalesHistory(data.sales);
         showToast('履歴をクラウドと同期しました', 'success');
@@ -331,42 +351,49 @@ export default function App() {
   };
 
   const submitOrder = async () => {
+    if (cart.length === 0 || totalAmount <= 0) { showToast('商品を追加してください', 'warning'); return; }
     const finalDeposit = parseInt(deposit) || totalAmount;
     if (finalDeposit < totalAmount) { play('error'); showToast('金額不足', 'error'); return; }
     
     const orderData = {
       deviceId: deviceName, staffName, items: cart, total: totalAmount, paymentMethod,
-      orderNumber, timestamp: new Date().toISOString(), isCanceled: false
+      orderNumber: null, clientOrderId: createClientOrderId(),
+      timestamp: new Date().toISOString(), isCanceled: false
     };
 
     setIsOrderSyncing(true);
-    setMenuItems(prev => prev.map(m => {
-      // カート内の同一IDの数量を合計して在庫を引く
-      const totalQty = cart.filter(c => c.id === m.id).reduce((sum, c) => sum + c.quantity, 0);
-      return (totalQty > 0 && !m.id.toString().startsWith('custom')) ? { ...m, stock: m.stock - totalQty } : m;
-    }));
-    setSalesHistory(prev => [orderData, ...prev]);
-
     let isOfflineAction = false;
+    let completedOrder = orderData;
     if (isQueueMode) {
         setUnsentOrders(prev => [...prev, orderData]);
         isOfflineAction = true;
     } else if (gasUrl && navigator.onLine) {
         try {
-            await fetch(gasUrl, { method: 'POST', body: JSON.stringify(orderData) });
+            const result = await postJson(gasUrl, { action: 'createOrder', order: orderData });
+            completedOrder = { ...orderData, orderNumber: result.orderNumber };
         } catch (e) {
-            setUnsentOrders(prev => [...prev, orderData]);
-            isOfflineAction = true;
+            showToast(e.message || '会計を保存できませんでした', 'error');
+            play('error');
+            setIsOrderSyncing(false);
+            return;
         }
     } else {
         setUnsentOrders(prev => [...prev, orderData]);
         isOfflineAction = true;
     }
 
-    setDisplayOrderNumber(orderNumber);
+    const provisionalNumber = `仮-${deviceName}-${orderNumber}`;
+    if (!completedOrder.orderNumber) completedOrder = { ...completedOrder, orderNumber: provisionalNumber };
+    setMenuItems(prev => prev.map(m => {
+      const totalQty = cart.filter(c => c.id === m.id).reduce((sum, c) => sum + c.quantity, 0);
+      return (totalQty > 0 && !m.id.toString().startsWith('custom')) ? { ...m, stock: Math.max(0, m.stock - totalQty) } : m;
+    }));
+    setSalesHistory(prev => [completedOrder, ...prev]);
+
+    setDisplayOrderNumber(completedOrder.orderNumber);
 
     play('success');
-    setLastOrderDetails({ total: totalAmount, deposit: finalDeposit, change: finalDeposit - totalAmount, orderNumber, isOfflineAction });
+    setLastOrderDetails({ total: totalAmount, deposit: finalDeposit, change: finalDeposit - totalAmount, orderNumber: completedOrder.orderNumber, isOfflineAction });
     setOrderNumber(n => n + 1);
     setCart([]); setDeposit(''); setPaymentMethod('cash');
     setIsOrderSyncing(false);
@@ -382,8 +409,11 @@ export default function App() {
     const remaining = [];
 
     for (const order of unsentOrders) {
-      try { await fetch(gasUrl, { method: 'POST', body: JSON.stringify(order) }); successCount++; } 
-      catch (e) { remaining.push(order); }
+      try {
+        const result = await postJson(gasUrl, { action: 'createOrder', order: { ...order, orderNumber: null } });
+        setSalesHistory(prev => prev.map(s => s.clientOrderId === order.clientOrderId ? { ...s, orderNumber: result.orderNumber } : s));
+        successCount++;
+      } catch (e) { remaining.push(order); }
     }
 
     setUnsentOrders(remaining);
@@ -393,18 +423,15 @@ export default function App() {
 
   const saveProduct = async (product) => {
     setIsMenuSyncing(true);
-    let finalProduct = { ...product };
+    const productId = editingProduct?.id || product.id || `m-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    let finalProduct = { ...product, id: productId, initialStock: editingProduct?.initialStock ?? product.stock };
 
     // base64画像 → GAS経由でGoogle Driveにアップロード
     if (product.imageUrl?.startsWith('data:') && gasUrl && navigator.onLine) {
       try {
         const base64 = product.imageUrl.split(',')[1];
         const mimeType = product.imageUrl.match(/data:([^;]+)/)?.[1] || 'image/jpeg';
-        const uploadRes = await fetch(gasUrl, {
-          method: 'POST',
-          body: JSON.stringify({ action: 'uploadImage', base64, mimeType, filename: `product_${product.id || Date.now()}.jpg` })
-        });
-        const uploadData = await uploadRes.json();
+        const uploadData = await postJson(gasUrl, { action: 'uploadImage', base64, mimeType, filename: `product_${productId}.jpg` });
         if (uploadData.url) {
           finalProduct.imageUrl = uploadData.url;
           setEditImageUrl(uploadData.url); // プレビューをDriveのURLに差し替え
@@ -414,39 +441,40 @@ export default function App() {
       }
     }
 
-    if (editingProduct) {
-      setMenuItems(prev => prev.map(i => i.id === finalProduct.id ? finalProduct : i));
-    } else {
-      setMenuItems(prev => [...prev, { ...finalProduct, id: `m-${Date.now()}`, initialStock: finalProduct.stock }]);
-    }
     if (gasUrl && navigator.onLine && !isQueueMode) {
       const productForGas = { ...finalProduct, imageUrl: finalProduct.imageUrl?.startsWith('data:') ? '' : (finalProduct.imageUrl || '') };
       try {
-        await fetch(gasUrl, { method: 'POST', body: JSON.stringify({ action: 'updateProduct', product: productForGas }) });
+        await postJson(gasUrl, { action: 'updateProduct', product: productForGas });
         showToast('保存しました（クラウド同期済）', 'success');
       } catch(e) {
-        showToast('ローカルのみ保存しました', 'warning');
+        showToast(e.message || 'クラウド保存に失敗しました', 'error');
+        setIsMenuSyncing(false);
+        return;
       }
     } else {
-      showToast('保存しました', 'success');
+      showToast('端末内に保存しました', 'warning');
     }
+    if (editingProduct) setMenuItems(prev => prev.map(i => i.id === finalProduct.id ? finalProduct : i));
+    else setMenuItems(prev => [...prev, finalProduct]);
     setEditingProduct(null); setIsEditMenuModalOpen(false); setIsMenuSyncing(false);
   };
 
   const deleteProduct = async (id) => {
     if(!window.confirm('この商品を削除しますか？')) return;
     setIsMenuSyncing(true);
-    setMenuItems(prev => prev.filter(i => i.id !== id));
     if (gasUrl && navigator.onLine && !isQueueMode) {
       try {
-        await fetch(gasUrl, { method: 'POST', body: JSON.stringify({ action: 'deleteProduct', id }) });
+        await postJson(gasUrl, { action: 'deleteProduct', id });
         showToast('削除しました（クラウド同期済）', 'success');
       } catch(e) {
-        showToast('ローカルのみ削除しました', 'warning');
+        showToast(e.message || 'クラウド削除に失敗しました', 'error');
+        setIsMenuSyncing(false);
+        return;
       }
     } else {
       showToast('削除しました', 'success');
     }
+    setMenuItems(prev => prev.filter(i => i.id !== id));
     setIsMenuSyncing(false);
   };
 
@@ -460,7 +488,7 @@ export default function App() {
       }).join('; ');
       return [new Date(s.timestamp).toLocaleString(), s.orderNumber, s.total, s.paymentMethod === 'cash' ? '現金' : '食券', itemsDetail, s.staffName, s.isCanceled ? '取消済' : ''];
     });
-    const csvContent = [headers, ...rows].map(e => e.join(",")).join("\n");
+    const csvContent = [headers, ...rows].map(row => row.map(escapeCsv).join(',')).join('\r\n');
     const blob = new Blob([new Uint8Array([0xEF, 0xBB, 0xBF]), csvContent], { type: 'text/csv;charset=utf-8;' });
     const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `sales_${new Date().toISOString().slice(0,10)}.csv`; link.click();
     showToast('CSVダウンロード', 'success');
@@ -470,8 +498,7 @@ export default function App() {
     if (!gasUrl) { showToast("URLを入力してください", "warning"); return; }
     setConnectionStatus('checking');
     try {
-      const res = await fetch(`${gasUrl}?action=ping`);
-      const data = await res.json();
+      const data = await fetchJson(`${gasUrl}?action=ping`);
       if (data.status === 'success') { setConnectionStatus('success'); showToast("接続成功", "success"); fetchAllData(true); } else throw new Error();
     } catch (e) { setConnectionStatus('error'); showToast("接続失敗", "error"); }
   };
@@ -849,6 +876,10 @@ export default function App() {
                     <h3 className="text-lg font-bold mb-3 flex items-center gap-2"><span className="bg-slate-800 text-white w-6 h-6 rounded-full flex items-center justify-center text-xs">2</span>Google Apps Script (GAS) の設定</h3>
                     <p className="text-sm text-slate-600 mb-3">スプレッドシートの「拡張機能」→「Apps Script」を開き、以下のコードを貼り付けて「デプロイ」してください。</p>
                     <div className="relative bg-slate-900 rounded-lg overflow-hidden">
+                      <button onClick={() => handleCopy(GAS_SCRIPT, 'GASスクリプトをコピーしました')} className="absolute top-2 right-2 bg-slate-700 hover:bg-slate-600 text-white px-2 py-1 rounded text-xs flex items-center gap-1 z-10"><Copy size={12}/> コピー</button>
+                      <pre className="text-green-400 text-[10px] p-4 pt-12 overflow-x-auto leading-relaxed whitespace-pre">{GAS_SCRIPT}</pre>
+                    </div>
+                    <div className="hidden">
                       <button onClick={() => handleCopy(`function doGet(e){const a=e.parameter.action,ss=SpreadsheetApp.getActiveSpreadsheet();if(a==='getMenu'){const sh=ss.getSheetByName('Menu'),d=sh.getDataRange().getValues(),items=d.slice(1).filter(r=>r[0]).map(r=>({id:r[0],category:r[1],name:r[2],price:Number(r[3]),stock:Number(r[4]),initialStock:Number(r[4]),imageUrl:r[5]||'',toppings:parseToppings(r[6]||'')}));return res({items})}if(a==='getStaff'){const sh=ss.getSheetByName('Staff');if(!sh)return res({staff:[]});const d=sh.getDataRange().getValues(),staff=d.slice(1).filter(r=>r[0]).map(r=>({name:r[0],shift:r[1]||'',role:r[2]||''}));return res({staff})}if(a==='getSales'){const sh=ss.getSheetByName('Sales');if(!sh)return res({sales:[]});const d=sh.getDataRange().getValues(),lim=Number(e.parameter.limit)||50,sales=d.slice(1).filter(r=>r[0]).slice(-lim).reverse().map(r=>({timestamp:r[0],total:r[1],items:JSON.parse(r[2]||'[]'),paymentMethod:r[3],deviceId:r[4],orderNumber:r[5],staffName:r[6],isCanceled:r[7]||false}));return res({sales})}if(a==='ping')return res({status:'success'});return res({status:'error'})}
 function doPost(e){const data=JSON.parse(e.postData.contents),ss=SpreadsheetApp.getActiveSpreadsheet();if(data.action==='uploadImage'){const decoded=Utilities.base64Decode(data.base64),blob=Utilities.newBlob(decoded,data.mimeType||'image/jpeg',data.filename||'product.jpg'),folders=DriveApp.getFoldersByName('BunkasaiPOS_Images'),folder=folders.hasNext()?folders.next():DriveApp.createFolder('BunkasaiPOS_Images'),file=folder.createFile(blob);file.setSharing(DriveApp.Access.ANYONE_WITH_LINK,DriveApp.Permission.VIEW);return res({status:'success',url:'https://drive.google.com/thumbnail?id='+file.getId()+'&sz=w400'})}if(data.action==='updateProduct'){const sh=ss.getSheetByName('Menu'),d=sh.getDataRange().getValues();for(let i=1;i<d.length;i++){if(d[i][0]==data.product.id){sh.getRange(i+1,1,1,7).setValues([[data.product.id,data.product.category,data.product.name,data.product.price,data.product.stock,data.product.imageUrl||'',strToppings(data.product.toppings||[])]]);return res({status:'success'})}}sh.appendRow([data.product.id,data.product.category,data.product.name,data.product.price,data.product.stock,data.product.imageUrl||'',strToppings(data.product.toppings||[])]);return res({status:'success'})}if(data.action==='deleteProduct'){const sh=ss.getSheetByName('Menu'),d=sh.getDataRange().getValues();for(let i=1;i<d.length;i++){if(d[i][0]==data.id){sh.deleteRow(i+1);return res({status:'success'})}}return res({status:'success'})}const sh=ss.getSheetByName('Sales')||ss.insertSheet('Sales');if(sh.getLastRow()===0)sh.appendRow(['Date','Total','Items','PaymentMethod','Device','OrderNum','Staff','Canceled']);sh.appendRow([data.timestamp,data.total,JSON.stringify(data.items),data.paymentMethod,data.deviceId,data.orderNumber,data.staffName,data.isCanceled||false]);return res({status:'success'})}
 function parseToppings(s){if(!s)return[];return s.split(',').map(t=>{const p=t.trim().split(':');return p.length>=2?{name:p[0].trim(),price:parseInt(p[1])||0}:null}).filter(t=>t&&t.name)}
